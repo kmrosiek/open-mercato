@@ -225,12 +225,17 @@ Both checkers now resolve target locales per module through `scripts/lib/i18n-lo
 - **Inside `apps/<app>/`**: the locale files present in `apps/<app>/src/i18n/`. That directory is
   already the step an app takes to add a language (upgrade note: add `src/i18n/<code>.json`), so it
   doubles as the app's declaration of which languages its own modules must carry. File names must
-  use the normalized code `registerLocales` stores (lowercase, hyphenated: `pt-br.json`). An app
-  without that directory follows the platform set.
+  use the normalized code `registerLocales` stores (lowercase, hyphenated: `pt-br.json`). A file
+  only counts as a locale when `registerLocales` could accept its code: it is declared in the
+  `locales` literal of `config.ts`, or its base subtag is in the ISO 639-1 table `iso639.ts` (read
+  as text, like `config.ts`). Unrelated JSON such as `faq.json` or `app.json` is ignored. An app
+  without that directory, or with no recognised locale file in it, follows the platform set.
 
 The resolver fails closed: an unreadable or inconsistent `config.ts` (including a `locales` array
-that is not entirely string literals) and a locale-shaped app file that is not normalized
-(`pt-BR.json`, `zh_Hant.json`) abort the check instead of silently dropping a language. In this repository both scopes resolve to `en, pl, es, de, ko`, so
+that is not entirely string literals, a duplicate `locales`/`defaultLocale` declaration, or a
+non-normalized code; declarations inside comments are ignored), an unreadable or empty
+`iso639.ts`, and a recognised-locale app file that is not normalized (`pt-BR.json`,
+`zh_Hant.json`) abort the check instead of silently dropping a language. In this repository both scopes resolve to `en, pl, es, de, ko`, so
 the checked locales, the findings, and the exit codes are unchanged; only the sync checker's
 header changes, listing each resolved scope with its locales.
 
@@ -475,3 +480,8 @@ change, not a behaviour change; an assertion covering the new prop was added alo
 - An app's locale files must use normalized codes (lowercase, hyphenated — the form `registerLocales` stores).
   A locale-shaped file such as `pt-BR.json` or `zh_Hant.json` now aborts the run with the rename to make,
   instead of being silently left out of the app's checked set.
+- 2026-11-04 — Follow-up (`open-mercato/open-mercato#8436`): app dictionary filenames are validated against
+  the declared `config.ts` locales plus ISO 639-1 base codes from `iso639.ts`, so `faq.json`/`app.json` never
+  enter either checker's target set while extra locales (`xh`, `cs`) and regional variants (`pt-br`) stay
+  supported. The `config.ts` parser now ignores comments, rejects duplicate declarations and requires
+  normalized locale codes. Regressions in `i18n-locale-set.test.mjs` and `i18n-check-values-scopes.test.mjs`.
