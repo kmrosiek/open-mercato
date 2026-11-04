@@ -30,10 +30,12 @@ App dictionary filenames only enter the translation checkers' target locale sets
 
 ## Progress
 
+PR: #3
+
 > Convention: `- [ ]` pending, `- [x]` done. Append ` — <commit sha>` when a step lands. Do not rename step titles.
 
 ### Phase 1: Filename validation and parser hardening
 
-- [ ] 1.1 Validate app dictionary filenames against ISO 639-1 and declared locales
-- [ ] 1.2 Harden the platform config parser
-- [ ] 1.3 Regression tests for filenames, regional variants and config parsing
+- [x] 1.1 Validate app dictionary filenames against ISO 639-1 and declared locales — 054f2e14a8
+- [x] 1.2 Harden the platform config parser — 054f2e14a8
+- [x] 1.3 Regression tests for filenames, regional variants and config parsing — 054f2e14a8
