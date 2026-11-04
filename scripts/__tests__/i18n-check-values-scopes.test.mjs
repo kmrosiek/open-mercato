@@ -30,6 +30,11 @@ function makeFixtureRepo() {
   }
   fs.symlinkSync(path.join(REPO_ROOT, 'node_modules'), path.join(root, 'node_modules'), 'junction')
   writeFile(root, 'packages/shared/src/lib/i18n/config.ts', CONFIG_SOURCE)
+  writeFile(
+    root,
+    'packages/shared/src/lib/i18n/iso639.ts',
+    fs.readFileSync(path.join(REPO_ROOT, 'packages', 'shared', 'src', 'lib', 'i18n', 'iso639.ts')),
+  )
   const platformDictionary = JSON.stringify({ 'auth.title': 'Sign in' })
   for (const locale of ['en', 'pl', 'es', 'de', 'ko']) {
     writeFile(root, `packages/core/src/modules/auth/i18n/${locale}.json`, platformDictionary)
@@ -77,4 +82,12 @@ test('without --module the report covers both scopes, each locale only for its o
   assert.deepEqual([...report.locales].sort(), ['de', 'es', 'ko', 'pl', 'xh'])
   assert.equal(report.modulesByLocale.xh, 2)
   assert.equal(report.modulesByLocale.pl, 1)
+})
+
+test('unrelated short-name JSON files next to app locales are not reported as locales', () => {
+  const root = makeFixtureRepo()
+  writeFile(root, 'apps/mercato/src/i18n/faq.json', JSON.stringify({ question: 'Why?' }))
+  writeFile(root, 'apps/mercato/src/i18n/app.json', JSON.stringify({ name: 'Mercato' }))
+  const report = runValuesChecker(root, ['--module', 'records'])
+  assert.deepEqual(report.locales, ['xh'])
 })
