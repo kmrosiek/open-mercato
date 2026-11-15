@@ -49,6 +49,19 @@ const SYSTEM_PROMPT = [
   'RESPONSE STYLE: Emit only the structured object. `summary` is one plain sentence an operator can read; it is not a restatement of the JSON.',
 ].join('\n')
 
+/**
+ * OpenAI strict structured outputs require every property to be listed in
+ * `required` and forbid open-ended objects, but `workflowDraftGenerationSchema`
+ * carries optional keys and a free-form activity `config` record, so
+ * `@ai-sdk/openai`'s default `strictJsonSchema: true` gets every draft request
+ * rejected with HTTP 400. The draft is re-parsed through the real definition
+ * schema by the generate route, so strict mode adds no safety here. Other
+ * providers ignore the `openai` namespace. Same fix as inbox_ops (#6287).
+ */
+export const WORKFLOW_DRAFT_PROVIDER_OPTIONS = {
+  openai: { strictJsonSchema: false },
+}
+
 const workflowAuthorAgent: AiAgentDefinition = {
   id: WORKFLOW_DRAFT_AGENT_ID,
   moduleId: 'workflows',
@@ -65,6 +78,9 @@ const workflowAuthorAgent: AiAgentDefinition = {
   // model that never converges cannot burn tokens or wall-clock unbounded.
   loop: {
     budget: { maxToolCalls: 4, maxWallClockMs: 20_000, maxTokens: 120_000 },
+  },
+  modelSettings: {
+    providerOptions: WORKFLOW_DRAFT_PROVIDER_OPTIONS,
   },
   output: {
     schemaName: 'WorkflowDraft',

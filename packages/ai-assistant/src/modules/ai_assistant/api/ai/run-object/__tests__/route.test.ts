@@ -399,6 +399,67 @@ describe('POST /api/ai_assistant/ai/run-object', () => {
     expect(json.code).toBe('tool_not_whitelisted')
   })
 
+  describe('model availability', () => {
+    function seedObjectAgent() {
+      seedAgentRegistryForTests([
+        makeAgent({
+          id: 'catalog.extract',
+          moduleId: 'catalog',
+          executionMode: 'object',
+          output: { schemaName: 'Extract', schema: z.object({ title: z.string() }) },
+        }),
+      ])
+    }
+
+    async function postExtract() {
+      return POST(
+        buildRequest({
+          agent: 'catalog.extract',
+          messages: [{ role: 'user', content: 'hi' }],
+        }) as any,
+      )
+    }
+
+    it('maps a missing provider key to 503 api_key_missing', async () => {
+      const { AiModelFactoryError } = await import('../../../../lib/model-factory')
+      seedObjectAgent()
+      runAiAgentObjectMock.mockRejectedValueOnce(new AiModelFactoryError('api_key_missing', 'no key'))
+
+      const response = await postExtract()
+
+      expect(response.status).toBe(503)
+      expect((await response.json()).code).toBe('api_key_missing')
+    })
+
+    it('maps a provider auth refusal to 503 provider_rejected', async () => {
+      seedObjectAgent()
+      runAiAgentObjectMock.mockRejectedValueOnce(
+        Object.assign(new Error('Incorrect API key'), { name: 'AI_APICallError', statusCode: 401 }),
+      )
+
+      const response = await postExtract()
+
+      expect(response.status).toBe(503)
+      expect((await response.json()).code).toBe('provider_rejected')
+    })
+
+    it('keeps a provider 400 (e.g. a rejected output schema) as a 500 failure', async () => {
+      seedObjectAgent()
+      runAiAgentObjectMock.mockRejectedValueOnce(
+        Object.assign(new Error("Invalid schema for response_format 'WorkflowDraft'"), {
+          name: 'AI_APICallError',
+          statusCode: 400,
+          responseBody: '{"error":{"message":"\'required\' is required to be supplied and to be an array including every key in properties."}}',
+        }),
+      )
+
+      const response = await postExtract()
+
+      expect(response.status).toBe(500)
+      expect((await response.json()).code).toBe('internal_error')
+    })
+  })
+
   describe('dispatcher-owned agents', () => {
     const AO_AGENT = 'ops.triage'
     const AGENT_RUN_ID = 'ao-run-1'

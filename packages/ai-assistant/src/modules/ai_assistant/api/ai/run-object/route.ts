@@ -12,6 +12,7 @@ import { runAiAgentObject } from '../../../lib/agent-runtime'
 import { AgentPolicyError } from '../../../lib/agent-tools'
 import { aiAgentHttpCallSettingsSchema } from '../../../lib/agent-call-contract'
 import { CORRELATION_ID_HEADER, resolveCorrelationId } from '../../../lib/mcp-audit'
+import { classifyModelUnavailableError } from '../../../lib/model-unavailable'
 import {
   isAiAgentDispatchDeniedError,
   resolveAiAgentRunDispatcher,
@@ -112,6 +113,11 @@ export const openApi: OpenApiRouteDoc = {
         { status: 409, description: 'Agent/tool/execution-mode policy violation, or no principal to run a dispatched agent as.' },
         { status: 422, description: 'Agent does not support object-mode execution, or a dispatched agent received an unsupported option (`dispatch_option_unsupported`).' },
         { status: 500, description: 'Internal runtime failure.' },
+        {
+          status: 503,
+          description:
+            'No usable LLM provider: `code` is `no_provider_configured`, `api_key_missing`, or `provider_rejected` (the configured provider refused the call for an auth, billing or quota reason).',
+        },
       ],
     },
   },
@@ -340,6 +346,11 @@ export async function POST(req: NextRequest): Promise<Response> {
   } catch (error) {
     if (error instanceof AgentPolicyError) {
       return jsonError(statusForDenyCode(error.code), error.message, error.code)
+    }
+    const modelUnavailableCode = classifyModelUnavailableError(error)
+    if (modelUnavailableCode) {
+      logger.warn('AI Run Object — No usable LLM provider', { code: modelUnavailableCode })
+      return jsonError(503, 'No usable LLM provider is available for this deployment.', modelUnavailableCode)
     }
     logger.error('AI Run Object — Dispatch failure', { err: error })
     return jsonError(

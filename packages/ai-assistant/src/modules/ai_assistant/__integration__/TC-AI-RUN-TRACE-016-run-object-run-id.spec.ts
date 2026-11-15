@@ -11,11 +11,13 @@ import { apiRequest, getAuthToken } from '@open-mercato/core/modules/core/__inte
  *     accepts every documented key (404 from the policy gate, not 400);
  *   - the OpenAPI document must declare `runId` (UUID) on the 200 response;
  *   - when a provider IS configured, a real object-mode run must return a UUID `runId`.
+ *     Only a 503 (no usable provider) skips; any other non-200, 500 included, fails.
  *
  * No records are created, so there is nothing to clean up.
  */
 const RUN_OBJECT_PATH = '/api/ai_assistant/ai/run-object';
 const OBJECT_AGENT_ID = 'workflows.workflow_author';
+const MODEL_UNAVAILABLE_STATUS = 503;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type JsonRecord = Record<string, unknown>;
@@ -153,9 +155,10 @@ test.describe('TC-AI-RUN-TRACE-016: run-object run id and call settings', () => 
     });
     const body = await readJson(response);
     test.skip(
-      response.status() !== 200,
-      `run-object did not complete (status ${response.status()}, code ${String(body.code ?? '')}); no LLM provider in this environment`,
+      response.status() === MODEL_UNAVAILABLE_STATUS,
+      `no usable LLM provider in this environment (code ${String(body.code ?? '')})`,
     );
+    expect(response.status(), `run-object failed: ${JSON.stringify(body)}`).toBe(200);
     expect(typeof body.runId).toBe('string');
     expect(String(body.runId)).toMatch(UUID_PATTERN);
   });
