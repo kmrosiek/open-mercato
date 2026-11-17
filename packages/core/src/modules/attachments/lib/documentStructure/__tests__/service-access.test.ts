@@ -1,6 +1,6 @@
 /** @jest-environment node */
 
-import { asValue, createContainer, InjectionMode } from 'awilix'
+import { asValue, createContainer, InjectionMode, type AwilixContainer } from 'awilix'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { AppContainer } from '@open-mercato/shared/lib/di/container'
 import {
@@ -10,6 +10,9 @@ import {
   AttachmentPartition,
 } from '../../../data/entities'
 import { register } from '../../../di'
+import { createAttachmentAccessContext } from '../../access-runner'
+import { registerAttachmentAccessResolvers } from '../../access-registry'
+import type { AttachmentAccessDecision, AttachmentAccessInput } from '../../access-types'
 import { resolveDocumentStructureWorkerDeps } from '../../../workers/document-structure'
 import {
   createDocumentStructureEngineRegistry,
@@ -467,6 +470,106 @@ describe('attachmentDocumentStructureService.requestExtraction', () => {
     const result = await service.requestExtraction({ attachmentId: ATTACHMENT_ID, scope: scopeA })
     expect(result).toEqual({ extractionId: EXTRACTION_ID, status: 'skipped', enqueued: false, jobId: null })
     expect(enqueue).not.toHaveBeenCalled()
+  })
+})
+
+describe('attachmentDocumentStructureService owner access', () => {
+  const OWNER_DOCUMENT_ID = '99999999-9999-4999-8999-999999999999'
+  const ownerScope: DocumentStructureAccessScope = {
+    tenantId: TENANT_A,
+    organizationId: ORG_A,
+    auth: { sub: 'owner-user', tenantId: TENANT_A, orgId: ORG_A },
+  }
+  const resolveOwner = jest.fn(async (input: AttachmentAccessInput): Promise<AttachmentAccessDecision> =>
+    input.subject.auth.sub === 'owner-user' ? { ok: true } : { ok: false, status: 404, reason: 'document_not_found' },
+  )
+  const rbac = {
+    loadAcl: jest.fn(async () => ({ isSuperAdmin: false, organizations: [ORG_A] })),
+    getEffectiveFeatures: jest.fn(async () => ['attachments.view']),
+  }
+  const accessContainer = { resolve: jest.fn(() => rbac) } as unknown as AwilixContainer
+
+  function ownerSetup(options: { withContext?: boolean } = {}) {
+    const fake = createFakeEm()
+    seed(fake)
+    const protectedRow = fake.table(Attachment).find((row) => row.id === ATTACHMENT_ID)!
+    protectedRow.entityId = 'documents:document'
+    protectedRow.recordId = OWNER_DOCUMENT_ID
+    const enqueue = jest.fn<ReturnType<DocumentStructureEnqueue>, Parameters<DocumentStructureEnqueue>>(
+      async () => 'job-1',
+    )
+    const service = createAttachmentDocumentStructureService({
+      em: fake.em,
+      enqueue,
+      ...(options.withContext === false ? {} : { resolveAccessContext: () => createAttachmentAccessContext(accessContainer) }),
+    })
+    return { service, enqueue }
+  }
+
+  async function readAll(service: AttachmentDocumentStructureService, scope: DocumentStructureAccessScope) {
+    const ref = buildCitationRef({ attachmentId: ATTACHMENT_ID, anchorKey: sectionRow(5).anchorKey as string })
+    return {
+      structure: await service.getStructure({ attachmentId: ATTACHMENT_ID, scope }),
+      sections: await service.listSections({ attachmentId: ATTACHMENT_ID, scope, limit: 3 }),
+      section: await service.getSection({ attachmentId: ATTACHMENT_ID, scope, numberLabel: '5' }),
+      citation: await service.resolveCitation({ ref, scope }),
+      text: await service.getNormalizedText({ attachmentId: ATTACHMENT_ID, scope, charStart: 0, charEnd: 6 }),
+      stats: await service.getStats({ attachmentId: ATTACHMENT_ID, scope }),
+    }
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    registerAttachmentAccessResolvers([{
+      moduleId: 'documents',
+      resolvers: [{ id: 'documents.attachments', targetPartition: '*', targetEntity: 'documents:document', resolve: resolveOwner }],
+      protectedTargets: [{ resolverId: 'documents.attachments', targetPartition: '*', targetEntity: 'documents:document' }],
+    }])
+  })
+  afterEach(() => registerAttachmentAccessResolvers([]))
+
+  it('hides every read and extraction request from a same-organization reader the owner policy denies', async () => {
+    const { service, enqueue } = ownerSetup()
+    const reads = await readAll(service, scopeA)
+    expect(reads).toEqual({ structure: null, sections: null, section: null, citation: null, text: null, stats: null })
+    expect(await service.requestExtraction({ attachmentId: ATTACHMENT_ID, scope: scopeA, force: true })).toBeNull()
+    expect(enqueue).not.toHaveBeenCalled()
+    expect(resolveOwner).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'read',
+      targets: [expect.objectContaining({ entityId: 'documents:document', recordId: OWNER_DOCUMENT_ID })],
+    }))
+  })
+
+  it('still serves the owner every read', async () => {
+    const { service } = ownerSetup()
+    const reads = await readAll(service, ownerScope)
+    expect(reads.structure?.extraction?.id).toBe(EXTRACTION_ID)
+    expect(reads.sections?.items).toHaveLength(3)
+    expect(reads.section?.text).toBe('Section 5 body text')
+    expect(reads.citation?.section.numberLabel).toBe('5')
+    expect(reads.text).toBe('SECRET')
+    expect(reads.stats?.attachmentId).toBe(ATTACHMENT_ID)
+  })
+
+  it('fails closed without an access context and for the auth-less service principal used by the CLI', async () => {
+    const withoutContext = ownerSetup({ withContext: false })
+    expect(await readAll(withoutContext.service, ownerScope)).toEqual({
+      structure: null, sections: null, section: null, citation: null, text: null, stats: null,
+    })
+    const cli = ownerSetup()
+    rbac.getEffectiveFeatures.mockResolvedValueOnce([])
+    const serviceScope: DocumentStructureAccessScope = { tenantId: TENANT_A, organizationId: ORG_A }
+    expect(await cli.service.getStructure({ attachmentId: ATTACHMENT_ID, scope: serviceScope })).toBeNull()
+    expect(await cli.service.requestExtraction({ attachmentId: ATTACHMENT_ID, scope: serviceScope })).toBeNull()
+    expect(resolveOwner).toHaveBeenCalledWith(expect.objectContaining({
+      subject: expect.objectContaining({ auth: expect.objectContaining({ sub: 'attachments:document-structure-service' }) }),
+    }))
+  })
+
+  it('leaves attachments without an owner policy readable for the same reader', async () => {
+    const { service } = ownerSetup()
+    registerAttachmentAccessResolvers([])
+    expect((await readAll(service, scopeA)).section?.text).toBe('Section 5 body text')
   })
 })
 

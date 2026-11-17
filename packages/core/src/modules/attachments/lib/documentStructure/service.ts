@@ -8,7 +8,8 @@ import {
   AttachmentDocumentSection,
   AttachmentPartition,
 } from '../../data/entities'
-import { assertAttachmentScopeInvariant, checkAttachmentAccess, isSuperAdminAuth } from '../access'
+import { assertAttachmentScopeInvariant, isSuperAdminAuth } from '../access'
+import { evaluateAttachmentAccess, type AttachmentAccessContext } from '../access-runner'
 import {
   buildCitation,
   buildCitationRef,
@@ -237,6 +238,7 @@ export type AttachmentDocumentStructureServiceDeps = {
   em: EntityManager
   enqueue?: DocumentStructureEnqueue
   queueContainer?: DocumentStructureQueueContainer | null
+  resolveAccessContext?: () => AttachmentAccessContext
 }
 
 type NormalizedScope = { tenantId: string | null; organizationId: string | null }
@@ -369,7 +371,14 @@ export function createAttachmentDocumentStructureService(
       normalized,
     )
     if (!partition || !partitionMatchesScope(partition, normalized)) return null
-    const access = checkAttachmentAccess(principal, attachment, partition, { requireAuthForPublic: true })
+    const access = await evaluateAttachmentAccess({
+      auth: principal,
+      attachment,
+      partition,
+      action: 'read',
+      context: deps.resolveAccessContext?.() ?? null,
+      requireAuthForPublic: true,
+    })
     if (!access.ok) return null
     return { attachment, scope: normalized }
   }

@@ -1,5 +1,11 @@
 # Upgrade Notes
 
+## Document-section text honors attachment owner access (#9648, B-15)
+
+**Security fix (core `attachments`).** The document-structure service now authorizes every read with the same owner-access rule (`read`) as `GET /api/attachments/file/:id`. Before, a same-organization user holding `attachments.view` could read the extracted text of an attachment owned by a protected record (for example a `documents:document` they cannot open) through `GET /api/attachments/structure/:id`, `GET /api/attachments/structure/:id/sections`, the `attachments.get_document_sections` AI tool and the cited-section page. These now answer 404 / `not_found` for such callers, as the file route does. Attachments without an owner policy are unchanged. `POST /api/attachments/structure/:id` (request extraction) is gated the same way.
+
+**Behaviour change:** `mercato attachments structure dump` and `structure extract` run as a service principal, not as a user, so they now report "not found" for owner-protected attachments. Tool calls with no user behind them are refused the same way. Background extraction, `structure backfill` and section indexing do not go through this check and are unaffected.
+
 ## File-defined agents declare governance in `GOVERNANCE.json` (#9648, B-3)
 
 **New (enterprise `agent_orchestrator`).** A file agent (`agents/<id>/`, also its sub-agents) can ship an optional `GOVERNANCE.json` with the `principal`, `integrity`, `untrustedInputs` and `modelSettings` keys `defineAgent` accepts. They are validated with the same parsers and enforced by the native runtime: principal provisioning and `toolAcl: 'intersect'`, output-integrity rules, untrusted-input screening and agent-level model settings. Agents without the file are unchanged, including their agent version.
