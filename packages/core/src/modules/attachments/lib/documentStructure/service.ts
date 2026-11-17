@@ -9,6 +9,7 @@ import {
   AttachmentPartition,
 } from '../../data/entities'
 import { assertAttachmentScopeInvariant, checkAttachmentAccess, isSuperAdminAuth } from '../access'
+import { evaluateAttachmentAccess, type AttachmentAccessContext } from '../access-runner'
 import {
   buildCitation,
   buildCitationRef,
@@ -237,6 +238,11 @@ export type AttachmentDocumentStructureServiceDeps = {
   em: EntityManager
   enqueue?: DocumentStructureEnqueue
   queueContainer?: DocumentStructureQueueContainer | null
+  /**
+   * Owner-access policy context for callers that pass `scope.auth`. Without it,
+   * owner-protected attachments are denied to those callers (fail closed).
+   */
+  createAccessContext?: () => AttachmentAccessContext
 }
 
 type NormalizedScope = { tenantId: string | null; organizationId: string | null }
@@ -369,7 +375,19 @@ export function createAttachmentDocumentStructureService(
       normalized,
     )
     if (!partition || !partitionMatchesScope(partition, normalized)) return null
-    const access = checkAttachmentAccess(principal, attachment, partition, { requireAuthForPublic: true })
+    if (scope.auth === undefined) {
+      const access = checkAttachmentAccess(principal, attachment, partition, { requireAuthForPublic: true })
+      if (!access.ok) return null
+      return { attachment, scope: normalized }
+    }
+    const access = await evaluateAttachmentAccess({
+      auth: principal,
+      attachment,
+      partition,
+      action: 'read',
+      context: deps.createAccessContext?.() ?? null,
+      requireAuthForPublic: true,
+    })
     if (!access.ok) return null
     return { attachment, scope: normalized }
   }
