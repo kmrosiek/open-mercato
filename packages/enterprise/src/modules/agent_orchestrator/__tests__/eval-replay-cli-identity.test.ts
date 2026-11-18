@@ -20,7 +20,7 @@ jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
 
 import { defineAgent, getAgentEntry } from '../lib/sdk/defineAgent'
 import { executeCaseRun, resetEvalSetManifestCache } from '../lib/eval/evalReplayService'
-import { isEvalOperatorUserId, parseEvalCliOperator } from '../lib/eval/evalRunSettings'
+import { EVAL_CLI_SENTINEL_OPERATOR, parseEvalCliOperator } from '../lib/eval/evalRunSettings'
 import { enforceAgentInvocable } from '../lib/access/agentInvokeAccess'
 import { resolveEffectiveToolAcl } from '../lib/identity/resolveEffectiveToolAcl'
 import type { AgentRunCtx } from '../lib/runtime/persistence'
@@ -30,6 +30,7 @@ const TENANT = '11111111-1111-4111-8111-111111111111'
 const ORG = '22222222-2222-4222-8222-222222222222'
 const OPERATOR = '44444444-4444-4444-8444-444444444444'
 const PRINCIPAL_USER = '99999999-9999-4999-8999-999999999999'
+const API_KEY_OPERATOR = 'api_key:77777777-7777-4777-8777-777777777777'
 const AGENT_ID = 'test.eval_cli_identity'
 const GATED_FEATURE = 'secret_module.secret_feature'
 
@@ -146,6 +147,13 @@ describe('eval replay identity for the CLI gate', () => {
     expect(ctx.runAs).toEqual({ agentUserId: PRINCIPAL_USER, onBehalfOfUserId: OPERATOR })
   })
 
+  it('an API-key operator keeps its own identity and never borrows the principal as caller', async () => {
+    const { ctx } = await replayOnce(API_KEY_OPERATOR)
+    expect(ctx.userId).toBe(API_KEY_OPERATOR)
+    expect(ctx.invoker).toEqual({ kind: 'user', userId: API_KEY_OPERATOR })
+    expect(ctx.runAs).toEqual({ agentUserId: PRINCIPAL_USER, onBehalfOfUserId: API_KEY_OPERATOR })
+  })
+
   it("without --user and without a principal the 'ci' identity is kept and nothing is bound", async () => {
     const { ctx } = await replayOnce('ci', [])
     expect(ctx.userId).toBe('ci')
@@ -169,8 +177,7 @@ describe('parseEvalCliOperator', () => {
     expect(parseEvalCliOperator(undefined, 'admin@example.com')).toMatchObject({ ok: false })
   })
 
-  it("treats the 'ci' sentinel as no operator", () => {
-    expect(isEvalOperatorUserId('ci')).toBe(false)
-    expect(isEvalOperatorUserId(OPERATOR)).toBe(true)
+  it("keeps the CLI sentinel operator as the literal 'ci'", () => {
+    expect(EVAL_CLI_SENTINEL_OPERATOR).toBe('ci')
   })
 })

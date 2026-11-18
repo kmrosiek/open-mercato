@@ -40,7 +40,7 @@ import {
 import { resolveRunAsForAgent } from '../identity/resolveRunAsForAgent'
 import {
   buildEvalRunToolSummary,
-  isEvalOperatorUserId,
+  EVAL_CLI_SENTINEL_OPERATOR,
   readEvalRunCallSettings,
   withEvalRunToolSummary,
 } from './evalRunSettings'
@@ -530,10 +530,11 @@ async function runCase(
         // A CLI gate started without `--user` carries the `'ci'` sentinel, which is
         // no user: the run then acts as the agent's principal for itself (invoke gate
         // and tool ACL both read the principal's grants), else keeps the sentinel.
-        const operatorIsUser = isEvalOperatorUserId(userId)
-        const actingUserId = !operatorIsUser && resolvedRunAs ? resolvedRunAs.agentUserId : userId
-        const runAs = resolvedRunAs && !operatorIsUser
-          ? { agentUserId: resolvedRunAs.agentUserId, onBehalfOfUserId: null }
+        // Any other operator, an API key included, keeps its own identity.
+        const principalSelf = userId === EVAL_CLI_SENTINEL_OPERATOR ? resolvedRunAs : null
+        const actingUserId = principalSelf?.agentUserId ?? userId
+        const runAs = principalSelf
+          ? { agentUserId: principalSelf.agentUserId, onBehalfOfUserId: null }
           : resolvedRunAs
         const callSettings = readEvalRunCallSettings(suiteRun?.summary)
         const invoke = () => runtime.run(agentDefinitionId, sourceInput(source), {

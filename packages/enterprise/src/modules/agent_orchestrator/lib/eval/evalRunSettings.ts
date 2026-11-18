@@ -99,14 +99,16 @@ export function parseEvalCliCallSettings(args: { temperature?: string; seed?: st
   return { ok: true, value: normalizeEvalRunCallSettings(parsed.data) }
 }
 
+/**
+ * The operator the CLI gate records when started without `--user`. Only this
+ * exact value makes an eval replay run its cases as the agent's principal; every
+ * other operator (a user, an API key) keeps its own identity.
+ */
+export const EVAL_CLI_SENTINEL_OPERATOR = 'ci'
+
 const evalOperatorUserIdSchema = z.string().uuid()
 
-/**
- * True when an eval replay's operator is a real `auth.User` id. The CLI gate
- * started without `--user` records the `'ci'` sentinel instead, and its cases
- * then run as the agent's principal.
- */
-export function isEvalOperatorUserId(userId: string | null | undefined): userId is string {
+function isEvalOperatorUserId(userId: string): boolean {
   return evalOperatorUserIdSchema.safeParse(userId).success
 }
 

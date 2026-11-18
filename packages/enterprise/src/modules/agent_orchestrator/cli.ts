@@ -20,7 +20,12 @@ import {
 import { recomputeProcessInstance } from './lib/processes/processProjection'
 import { EVAL_SET_EXPORT_CURRENT, EVAL_SET_SNAPSHOT_LATEST, evalSetSnapshotSchema } from './data/validators'
 import { runEvalGate } from './lib/eval/evalGate'
-import { parseEvalCliCallSettings, parseEvalCliOperator, readEvalRunToolSummary } from './lib/eval/evalRunSettings'
+import {
+  EVAL_CLI_SENTINEL_OPERATOR,
+  parseEvalCliCallSettings,
+  parseEvalCliOperator,
+  readEvalRunToolSummary,
+} from './lib/eval/evalRunSettings'
 import { formatMockSummaryLine, readEvalRunMockSummary } from './lib/eval/toolMocks'
 import {
   EVAL_TOOL_FIXTURE_TENANT_DATA_WARNING,
@@ -876,7 +881,7 @@ const evalGate: ModuleCli = {
         baselineSuiteRunId: args.baseline ?? null,
         repeatCount,
         scope,
-        triggeredBy: operator.value ?? 'ci',
+        triggeredBy: operator.value ?? EVAL_CLI_SENTINEL_OPERATOR,
         ...(callSettings.value ? { callSettings: callSettings.value } : {}),
         ...(toolFixtures.options ? { toolFixtures: toolFixtures.options } : {}),
         ...(modelFixtures.options ? { modelFixtures: modelFixtures.options } : {}),
