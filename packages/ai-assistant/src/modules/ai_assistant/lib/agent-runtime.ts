@@ -1846,7 +1846,9 @@ function buildRuntimeMutationPolicySection(
       `Tools that REQUIRE APPROVAL under the effective policy: ${gated.join(', ')}.`,
     )
     lines.push(
-      'When you call any of these, the dispatcher returns an "awaiting confirmation" envelope and renders an inline approval card. Tell the operator the change is pending their confirmation; do NOT claim it has been applied.',
+      channel === 'agent'
+        ? 'When you call any of these, the dispatcher returns an "awaiting confirmation" envelope and renders an inline approval card. Tell the operator the change is pending their confirmation; do NOT claim it has been applied.'
+        : 'When you call any of these, the change is queued as a pending action and the dispatcher returns an "awaiting confirmation" envelope. It will NOT run until it is approved on the Pending AI actions page. Report it as pending approval; do NOT claim it has been applied.',
     )
   }
   if (conditional.length > 0) {
