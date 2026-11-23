@@ -11,13 +11,14 @@ Extends: `.ai/specs/implemented/2026-05-29-org-scope-fail-open-authorization-har
 
 **Scope:**
 - A `ReadScope` type plus query helpers in `@open-mercato/shared`.
-- A `resolveReadScope` resolver in `core/directory`, and a named `systemScope()` for workers/CLI.
-- Pilot in `audit_logs`: `ActionLogService` and `AccessLogService` gain `listScoped` / `countScoped`; their three routes migrate; `list` / `count` are deprecated.
+- A `resolveReadScope` resolver in `core/directory` that also applies the `?organizationId=` narrowing, and a named `systemScope()` for workers/CLI.
+- Pilot in `audit_logs`: `ActionLogService` and `AccessLogService` gain `listScoped` / `countScoped`; their three routes migrate; `list` / `count` are deprecated. The pilot covers `list` / `count` only; the services' other read methods stay as they are (see Follow-ups).
+- One deliberate HTTP behavior change, on the `access` route only (see 📝 Delta). Everything else is behavior-preserving.
 - Out of scope, tracked as follow-ups: the cross-repo inventory, migrating callers in other modules, and removing the deprecated methods.
 
 **Concerns:**
 - Public service signatures change, so the deprecation protocol in `BACKWARD_COMPATIBILITY.md` applies.
-- TypeScript branding can be bypassed by casts. A small CI allowlist check covers the one constructor that must stay exported across packages.
+- TypeScript branding can be bypassed by casts. A small CI check restricts who may import the low-level constructor and the test constructor; it covers this monorepo only.
 
 ## Overview
 
@@ -44,14 +45,14 @@ Evidence that the convention "routes deny first" keeps failing:
 |---|---|---|---|
 | #3817 / #3818 | `tenantId` (tenant-less principal with `view_tenant`) | Decrypted action logs of **every tenant** | Route guard `requireResolvedTenantScope` (spec 2026-07-28) |
 | #10432 | `organizationId` (explicitly empty org scope with `view_tenant`) | Every organization's action logs incl. snapshots, list + CSV export | Route guard `resolveSingleOrganizationIdOrDeny` |
-| `record_locks` follow-up | `organizationId` (null passed to `findLatestActionLogWithScopeFallback`) | Latest action log id + conflict data for a known resource id | Not yet fixed |
+| `record_locks` follow-up | `organizationId` (null passed to `findLatestActionLogWithScopeFallback`) | Latest action log id + conflict data for a known resource id | Route guard, PR #10448 (open, not merged) |
 
 The #6932 hardening (2026-10-07) recorded the intended invariant: "`organizationId: undefined` remains exclusive to unrestricted scope". Nothing enforces it. #10432 slipped through because those routes obtained the fallback indirectly (`resolveFeatureCheckContext().organizationId`), which the pattern-based audit did not match.
 
 ## Proposed Solution
 
 1. **`ReadScope` (shared).** A branded, discriminated union describing exactly what a caller may read, plus helpers that turn it into Kysely and MikroORM predicates. `none` compiles to a no-row predicate.
-2. **One resolver (core/directory).** `resolveReadScope({ container, auth, request })` derives the scope from the same inputs routes use today and reproduces their current decisions exactly. `narrowReadScope(scope, organizationId)` implements today's "`?organizationId=` narrows only within the allowed set".
+2. **One resolver (core/directory).** `resolveReadScope({ container, auth, request, requestedOrganizationId })` derives the scope from the same inputs routes use today. It applies today's "`?organizationId=` narrows only within the caller's visibility set" itself, because the finished `ReadScope` no longer holds that set. It reproduces the routes' current decisions with one listed exception (📝 Delta).
 3. **Named system scope.** `systemScope({ tenantId })` and `systemScope.allTenants()` for workers, CLI and other code with no request principal: greppable and visible in review.
 4. **Scoped service methods.** New `listScoped(scope, filters)` / `countScoped(scope, filters)` where `filters` no longer accepts `tenantId` / `organizationId`. Old `list` / `count` stay, unchanged and `@deprecated`, for at least one minor version.
 5. **Pilot only.** Migrate `audit_logs` (both services, three routes). The inventory of other services, other-module callers, and removal of the deprecated methods are follow-ups.
@@ -67,6 +68,10 @@ The #6932 hardening (2026-10-07) recorded the intended invariant: "`organization
 | New `listScoped` method instead of changing `list` | Additive; existing callers, including third-party modules, keep working through the deprecation window. |
 | Actor narrowing (`actorSubject`, `actorUserId`) stays a **filter**, not scope | It is a per-feature visibility rule (`view_self` vs `view_tenant`), not isolation; mixing them would bloat the type. |
 | Resolver preserves current single-org narrowing (restricted user with no selection reads `allowedIds[0]`, per `resolveFeatureCheckOrganizationId`) | Widening to all allowed orgs would be a behavior change. It is tracked by #6337 and stays out of this spec. |
+| `?organizationId=` narrowing happens **inside** `resolveReadScope`, against `scope.allowedIds` | The routes narrow against the visibility set (`allowedIds`), which can hold more orgs than the effective one. A `narrowReadScope(scope, id)` applied afterwards would see only `some [effectiveOrg]` and silently ignore valid requests (review finding M1). There is no separate `narrowReadScope`. |
+| `allTenants` carries an `organizations` part too | A tenant-less superadmin with a selected or requested org is read today as `organization_id = X` with no tenant predicate. Without this, the resolver would widen that caller to every organization of every tenant. |
+| The tenant predicate comes from `auth.tenantId`, as today | The routes pass `auth.tenantId`, not `scope.tenantId`. Keeping the same source avoids a second, untested way to pick the tenant. |
+| An explicitly empty org scope is `none` on **all three** routes, including the `access` self-read | Today that self-read drops the org predicate and returns the caller's rows from every organization of the tenant. Preserving it would need a way to hand "all organizations" to a caller who can see none, which is the pattern this spec removes. Accepted as the one behavior change; see 📝 Delta. |
 | Type named `ReadScope` | `OrganizationScope` already names two different types (`shared/lib/auth/principal-service.ts:57`, `shared/lib/search/availability.ts:4`) plus the directory one; a fourth meaning would confuse. |
 
 ### Alternatives Considered
@@ -84,7 +89,7 @@ The #6932 hardening (2026-10-07) recorded the intended invariant: "`organization
 - **A module developer** writes a custom list route and **cannot call the audit-log service without a scope**, so they cannot accidentally ship a tenant-wide read.
 - **A worker author** needs a tenant-wide read and **writes `systemScope({ tenantId })`**, which reviewers see and can question.
 - **A security reviewer** **greps for `systemScope` / `unsafeCreateReadScope`** to list every unrestricted read path, instead of auditing every call site.
-- **A restricted employee** with an emptied organization visibility list **gets no rows**, whatever route they hit, without each route needing its own guard.
+- **A restricted employee** with an emptied organization visibility list **gets no rows** (or the 403 a route already documents), whatever route they hit, without each route needing its own guard.
 
 ## Architecture
 
@@ -109,7 +114,7 @@ Takeaway: the scope decision is made once (resolver or `systemScope`), carried a
 declare const readScopeBrand: unique symbol
 
 export type ReadScopeData =
-  | { kind: 'allTenants' }
+  | { kind: 'allTenants'; organizations: OrganizationReadScope }
   | { kind: 'tenant'; tenantId: string; organizations: OrganizationReadScope }
   | { kind: 'none' }
 
@@ -122,26 +127,83 @@ export type ReadScope = ReadScopeData & { readonly [readScopeBrand]: true }
 
 - An empty organization set is not representable as `some`; it normalizes to top-level `none`.
 - `systemScope` has no production caller in the pilot (the three migrated routes all use the resolver); it ships with unit tests so follow-up migrations of workers and CLI can use it.
+- `allTenants` + `some [X]` compiles to the organization predicate alone (no tenant predicate). Organization ids are UUIDs, so this reads one organization; it exists only to reproduce today's tenant-less superadmin read. `systemScope.allTenants()` always returns `allTenants` + `all`.
 - Exported helpers: `systemScope({ tenantId })`, `systemScope.allTenants()`, `isNoneScope(scope)`, `applyReadScopeToKysely(query, scope, { tenantColumn, organizationColumn })`, `readScopeToMikroFilter(scope, { tenantField, organizationField })`.
 - `none` → Kysely `where(sql\`false\`)`, MikroORM `{ id: { $in: [] } }`. Callers may also short-circuit with `isNoneScope` to skip the query (as `AccessLogService` already does).
-- Subpath `@open-mercato/shared/lib/auth/readScope/unsafe` exports `unsafeCreateReadScope(data)`; allowlisted importers: `core/directory/utils/readScope.ts`, `shared/lib/testing/readScope.ts` (`testScope`).
+- The helpers always produce the WHERE predicate. The scope passed to `findWithDecryption` is not a filter and must not stand in for it (lesson `decryption-scope-argument-is-not-a-where-filter`).
+- Subpath `@open-mercato/shared/lib/auth/readScope/unsafe` exports `unsafeCreateReadScope(data)`; allowlisted importers: `shared/lib/auth/readScope.ts` (`systemScope`), `core/directory/utils/readScope.ts`, `shared/lib/testing/readScope.ts` (`testScope`).
+- `testScope` may be imported from test files only; the same CI check enforces it (see Phase 1.3).
 
 ### Resolver (`packages/core/src/modules/directory/utils/readScope.ts`)
 
-`resolveReadScope({ container, auth, request })` truth table. It must match today's route behavior exactly; Phase 2 freezes it with a table-driven test.
+Code references in this section are to `main` @ `a433fc7e8d`, which includes #10432. The PR branch is based on an older commit that does not.
 
-| Caller state | Today | `ReadScope` |
-|---|---|---|
-| No auth | 401 before scope | (route keeps returning 401; resolver not called) |
-| `tenantId` null, not superadmin | 403 (`requireResolvedTenantScope`) | `none` |
-| `tenantId` null, superadmin | cross-tenant read | `allTenants` |
-| `allowedIds: []` or `filterIds: []` | 403 (`resolveSingleOrganizationIdOrDeny`) | `none` |
-| `allowedIds: null` and no selected org | whole tenant | `tenant` + `all` |
-| selected org, or default org resolved | that org | `tenant` + `some [org]` |
+```ts
+export type ResolvedReadScope = {
+  scope: ReadScope
+  organizationId: string | null
+  featureContext: FeatureCheckContext
+}
 
-`narrowReadScope(scope, requestedOrganizationId)` returns `some [requested]` when the requested org lies inside the scope (or the scope is `all`), otherwise the scope unchanged — today's `queryOrgId` behavior in the audit-log routes.
+export function deriveReadScope(input: {
+  auth: AuthContext
+  featureContext: FeatureCheckContext
+  requestedOrganizationId?: string | null
+}): ResolvedReadScope
 
-Routes may still return 403 for `none` where the documented contract says so (the audit-log routes do since #10432); services return empty results for `none`.
+export async function resolveReadScope(input: {
+  container: AwilixContainer
+  auth: AuthContext
+  request: Request
+  requestedOrganizationId?: string | null
+}): Promise<ResolvedReadScope>
+```
+
+- `resolveReadScope` calls the existing `resolveFeatureCheckContext` once, then `deriveReadScope`. `deriveReadScope` is pure and synchronous, so the truth table is tested without a container.
+- `organizationId` is the effective single organization (`O` below), or `null`. Routes keep using it where they use `organizationId` today: the `canViewTenant` RBAC check in `access`, redaction context, and the response body. `featureContext.organizationId` is the pre-narrowing default that `actions` and `actions/export` pass to their `canViewTenant` check. Neither changes.
+
+**Inputs.** `V` = `featureContext.scope.allowedIds` (the visibility set; `null` means unrestricted). `E` = `featureContext.organizationId`, which `resolveFeatureCheckOrganizationId` computes as `scope.selectedId`, else `auth.orgId` when `V` is `null` or contains it, else `V[0]`, else `null`. `Q` = `requestedOrganizationId`.
+
+**Step 1: effective organization `O`.** Same expression as `actions/route.ts:203-207`, `actions/export/route.ts:159-163` and `access/route.ts:104-108`:
+
+```ts
+const O = Q && (V === null || V.includes(Q)) ? Q : E
+```
+
+| `V` | `E` | `Q` | `O` | Note |
+|---|---|---|---|---|
+| any | `E` | absent | `E` | No request, default org |
+| `null` | `A` | `B` | `B` | Unrestricted caller switches org |
+| `null` | `null` | `B` | `B` | Unrestricted caller, no default |
+| `[A, B]` | `A` | `B` | `B` | Requested org inside visibility |
+| `[A]` | `A` | `B` | `A` | Requested org outside visibility: ignored, no error (as today) |
+
+**Step 2: scope.** Rules are evaluated in order; the first match wins.
+
+| # | Caller state | Today: `actions`, `actions/export` | Today: `access` | `ReadScope` |
+|---|---|---|---|---|
+| R1 | No auth | 401 | 401 | `none` (routes answer 401 first) |
+| R2 | `auth.tenantId` falsy, not superadmin | 403 (`requireResolvedTenantScope`) | 403 (same) | `none` |
+| R3 | `scope.filterIds` or `scope.allowedIds` is `[]` (`isExplicitlyEmptyOrganizationScope`) | 403 (`resolveSingleOrganizationIdOrDeny`, since #10432) | 200. Other actors: empty page. Self-read: the caller's rows from **every organization of the tenant** | `none` (**changes the `access` self-read**, Delta D1) |
+| R4 | `V` is an array and `O` is `null` or not in `V` | Unreachable | Unreachable | `none` |
+| R5 | `auth.tenantId` falsy, superadmin, `O` is `null` | All rows of all tenants | Same | `allTenants` + `all` |
+| R6 | `auth.tenantId` falsy, superadmin, `O` = `X` | `organization_id = X`, no tenant predicate | Same | `allTenants` + `some [X]` |
+| R7 | Tenant `T`, `V` is `null`, `O` is `null` | `tenant_id = T`, no org predicate | Same | `tenant T` + `all` |
+| R8 | Tenant `T`, `O` = `X` | `tenant_id = T AND organization_id = X` | Same | `tenant T` + `some [X]` |
+
+Notes on the rows:
+
+- **R4 is the "unknown state" rule.** `resolveOrganizationScope` only returns a `selectedId` inside the allowed set, `E` checks `auth.orgId` against `V`, and `Q` is checked in Step 1, so a restricted caller always has `O` inside `V` today. If a future change to those helpers breaks that, the resolver returns `none` instead of an unrestricted or out-of-visibility read. A restricted caller (`V` is an array) can never receive `all`.
+- **R7 is narrower than "unrestricted caller with no selection".** `E` falls back to `auth.orgId`, so an unrestricted non-superadmin with a home org lands in R8 with their home org, even after choosing "All organizations". R7 is reached only when `scope.selectedId` and `auth.orgId` are both `null` and no `Q` is honored: a superadmin viewing all organizations (the org cookie override clears `auth.orgId`), or a principal with no home org.
+- **R6**: `Q` is honored for an unrestricted caller without checking which tenant the org belongs to, as today. With a tenant (R8) a foreign org id matches no rows; without one (R6) it reads that org. Only a superadmin reaches R6.
+- **R3 and R2 keep their 403 on the routes that return one today.** The services return empty results for `none`.
+
+**Per-route result after migration.**
+
+| Route | R2 | R3 | R4 | R5–R8 |
+|---|---|---|---|---|
+| `actions`, `actions/export` | 403, unchanged | 403, unchanged | 200 empty (unreachable today) | Unchanged |
+| `access` | 403, unchanged | 200 empty page for self-reads and other-actor reads (**self-read changes**, D1) | 200 empty (unreachable today) | Unchanged |
 
 ### Commands & Events
 
@@ -153,7 +215,7 @@ No schema, entity or migration changes.
 
 ## API Contracts
 
-No HTTP contract changes: same routes, query parameters, response shapes and status codes as after #10432. The changes are TypeScript service contracts:
+Same routes, query parameters, response shapes and status codes as after #10432. One response body changes on the `access` route (📝 Delta D1). The contract changes are TypeScript:
 
 | Surface | Change | BC class |
 |---|---|---|
@@ -163,13 +225,24 @@ No HTTP contract changes: same routes, query parameters, response shapes and sta
 | `ActionLogService.list` / `count`, `AccessLogService.list` | `@deprecated`, behavior unchanged | Deprecation (removal ≥1 minor later) |
 | `ActionLogScopedFilters` = `actionLogListSchema.omit({ tenantId, organizationId })`; `AccessLogScopedFilters` likewise (also omits `organizationIds`) | New exported types | Additive |
 | `@open-mercato/shared/lib/auth/readScope`, `/readScope/unsafe`, `@open-mercato/shared/lib/testing/readScope` | New import paths | Additive |
-| `@open-mercato/core/modules/directory/utils/readScope` | New import path | Additive |
+| `@open-mercato/core/modules/directory/utils/readScope` (`resolveReadScope`, `deriveReadScope`, `ResolvedReadScope`) | New import path | Additive |
+| `isSuperAdminAuth` exported from `@open-mercato/shared/lib/auth/server` | Existing private function becomes an export | Additive |
 
 DI keys `actionLogService` / `accessLogService` are unchanged.
 
 ## 📝 Delta
 
-No observable HTTP behavior changes. Phase 3 begins with characterization tests that freeze current route behavior (status codes and the service predicates for every row of the resolver truth table) before the routes switch to `listScoped`; the same tests must pass after the switch.
+One observable HTTP behavior change. Everything else is frozen by characterization tests.
+
+| # | Route | Caller state | Today | After |
+|---|---|---|---|---|
+| D1 | `GET /api/audit_logs/audit-logs/access` | Explicitly empty organization scope (`allowedIds: []` or `filterIds: []`), reading own rows (`actorUserId === auth.sub`) | 200 with the caller's access-log rows from every organization of the tenant (the route passes `organizationIds: undefined`, so the service adds no org predicate) | 200 with an empty page (`items: []`, `total: 0`) |
+
+Why D1 is accepted instead of preserved: an explicitly empty scope means "this principal can see no organization" (#10432, lesson `empty-collection-scopes-need-an-explicit-semantic-predicate`). The self-read returns resource kinds and ids from organizations the caller can no longer see. The status stays 200 so the route's documented contract does not change; aligning it with the 403 of `actions` is not part of this spec.
+
+Not changed: the same caller reading other actors on `access` already gets an empty page, and `actions` / `actions/export` already return 403 (only those two got the #10432 guard; `access` never did).
+
+Phase 3 begins with characterization tests that freeze current route behavior (status codes and the service predicates for every row of both resolver tables) before the routes switch to `listScoped`. The same tests must pass after the switch, except the single D1 case, which is written as a pair: the pre-switch expectation and the post-switch expectation, with the change made in the same commit as the route migration.
 
 ## Internationalization (i18n)
 
@@ -191,18 +264,26 @@ None.
 ### Phase 1: `ReadScope` primitives in shared
 1. Add `packages/shared/src/lib/auth/readScope.ts` (type, `systemScope`, `isNoneScope`, `readScopeToMikroFilter`, `applyReadScopeToKysely`) and `readScope/unsafe.ts`. Unit tests: every variant produces the expected predicate; `none` yields no rows; a hand-built literal fails to type-check (`// @ts-expect-error` test).
 2. Add `packages/shared/src/lib/testing/readScope.ts` with `testScope(data)`.
-3. Add `scripts/check-read-scope-constructor.mjs` (grep: `readScope/unsafe` imported only from the allowlist) and wire it into `yarn lint`. Runs in seconds.
+3. Add `scripts/check-read-scope-constructor.mjs`. It scans `packages/**`, `apps/**` and `external/official-modules/**` when present, and fails on any of:
+   - `readScope/unsafe` imported outside the three allowlisted files;
+   - `lib/testing/readScope` imported from a non-test file (anything outside `__tests__/**`, `__integration__/**`, `*.test.ts(x)`, `*.spec.ts(x)`);
+   - `systemScope` imported in an API route file (`**/api/**/route.ts`). A request handler has a principal and must use the resolver.
+
+   Wire it as its own step in the `lint` job of `.github/workflows/ci.yml` (`node scripts/check-read-scope-constructor.mjs`, next to `yarn lint:check-graph`), following the `check-oauth-publish-shape.mjs` precedent, plus a root script alias `lint:check-read-scope` for local runs. The root `lint` script (`turbo run lint`) is not changed. Runs in seconds.
 
 ### Phase 2: resolver in core/directory
-1. Add `resolveReadScope` and `narrowReadScope` in `packages/core/src/modules/directory/utils/readScope.ts`, built on `resolveFeatureCheckContext` plus the `isSuperAdmin` read from `audit_logs/api/audit-logs/readScope.ts`.
-2. Table-driven unit test covering every truth-table row, plus `narrowReadScope` inside/outside the allowed set.
+1. Export `isSuperAdminAuth` from `packages/shared/src/lib/auth/server.ts` (it is module-private today at line 155). `audit_logs/api/audit-logs/readScope.ts` drops its private copy and imports it. `core/directory` imports nothing from `audit_logs`.
+2. Add `deriveReadScope` and `resolveReadScope` in `packages/core/src/modules/directory/utils/readScope.ts`, built on `resolveFeatureCheckContext`, `isExplicitlyEmptyOrganizationScope` and `isSuperAdminAuth`.
+3. Table-driven unit test of `deriveReadScope`: every row of the Step 1 table (requested org inside and outside visibility, with `allowedIds` both `null` and an array) and every rule R1–R8, including R4 with a hand-built inconsistent context (restricted caller with no effective org, and with an effective org outside `allowedIds`) asserting `none`.
 
 ### Phase 3: `audit_logs` pilot
-1. Characterization tests first: for `actions`, `actions/export`, `access` routes, assert status and the service query for every truth-table row (extending `api/__tests__/{actions,export,access}.route.test.ts`). They must pass on the unchanged code.
-2. Add `listScoped` / `countScoped` to `ActionLogService`; `buildListQuery` takes the scope through `applyReadScopeToKysely`; `list` / `count` map their optional ids onto the same builder, unchanged in behavior. Service unit tests for every scope kind, including `none` returning no rows without decrypting anything.
+1. Characterization tests first: for `actions`, `actions/export`, `access` routes, assert status and the service query for every row of both resolver tables (extending `api/__tests__/{actions,export,access}.route.test.ts`). They must pass on the unchanged code. The `access` tests cover the empty scope for both a self-read and an other-actor read.
+2. Add `listScoped` / `countScoped` to `ActionLogService`; `buildListQuery` takes the scope through `applyReadScopeToKysely`; `list` / `count` map their optional ids onto the same builder, unchanged in behavior. Service unit tests for every scope kind, including `allTenants` + `some` and `none` returning no rows without decrypting anything.
 3. Add `AccessLogService.listScoped`; same approach.
-4. Migrate the three routes to `resolveReadScope` + `narrowReadScope` + `listScoped`. Keep `requireResolvedTenantScope` and the #10432 403 responses so the HTTP contract is identical. Characterization tests stay green.
-5. Mark `list` / `count` `@deprecated`; add the `UPGRADE_NOTES.md` entry; update the `packages/core/AGENTS.md` "Access Control" section with a one-line rule: "read services take a `ReadScope`".
+4. Migrate the three routes to `resolveReadScope({ ..., requestedOrganizationId })` + `listScoped`. Keep `requireResolvedTenantScope` and the #10432 403 responses on `actions` / `actions/export`. Characterization tests stay green; the D1 self-read expectation flips in this commit.
+5. Mark `list` / `count` `@deprecated`; add the `UPGRADE_NOTES.md` entry, which also records D1; update the `packages/core/AGENTS.md` "Access Control" section with a one-line rule: "read services take a `ReadScope`".
+
+**Pilot boundary.** "The pilot services fail closed" applies to `list` / `count` only. These `ActionLogService` reads keep an optional or truthiness-gated scope, or none at all, and are not touched: `latestUndoableForActor`, `latestUndoneForActor`, `latestUndoableForResource`, `findById`, `findByUndoToken`, and the related-entries query (`actionLogService.ts:911-912`). They belong to Follow-ups 2 (single-record loads) and 4 (inventory).
 
 ### File Manifest
 
@@ -212,13 +293,16 @@ None.
 | `packages/shared/src/lib/auth/readScope/unsafe.ts` | Create | Allowlisted constructor |
 | `packages/shared/src/lib/testing/readScope.ts` | Create | `testScope` for tests |
 | `scripts/check-read-scope-constructor.mjs` | Create | CI allowlist check |
-| `packages/core/src/modules/directory/utils/readScope.ts` | Create | `resolveReadScope`, `narrowReadScope` |
+| `packages/core/src/modules/directory/utils/readScope.ts` | Create | `resolveReadScope`, `deriveReadScope` |
+| `packages/shared/src/lib/auth/server.ts` | Modify | Export `isSuperAdminAuth` |
+| `packages/core/src/modules/audit_logs/api/audit-logs/readScope.ts` | Modify | Use the shared `isSuperAdminAuth` |
 | `packages/core/src/modules/audit_logs/services/actionLogService.ts` | Modify | `listScoped`, `countScoped`, deprecate `list`/`count` |
 | `packages/core/src/modules/audit_logs/services/accessLogService.ts` | Modify | `listScoped`, deprecate `list` |
 | `packages/core/src/modules/audit_logs/data/validators.ts` | Modify | Scoped filter schemas |
 | `packages/core/src/modules/audit_logs/api/audit-logs/{actions,actions/export,access}/route.ts` | Modify | Use resolver + `listScoped` |
-| `UPGRADE_NOTES.md` | Modify | Deprecation entry |
-| `package.json` (root) | Modify | Wire `check-read-scope-constructor` into `yarn lint` |
+| `UPGRADE_NOTES.md` | Modify | Deprecation entry and D1 |
+| `.github/workflows/ci.yml` | Modify | Dedicated step in the `lint` job |
+| `package.json` (root) | Modify | Add the `lint:check-read-scope` alias (root `lint` unchanged) |
 | `packages/core/AGENTS.md` | Modify | One-line rule: read services take a `ReadScope` |
 | `packages/shared/src/lib/auth/__tests__/readScope.test.ts` | Create | Predicate and brand tests |
 | `packages/core/src/modules/directory/utils/__tests__/readScope.test.ts` | Create | Resolver truth table |
@@ -236,11 +320,11 @@ None.
 ### Tenant & Data Isolation Risks
 
 #### Resolver diverges from today's route logic
-- **Scenario**: `resolveReadScope` maps a caller state differently than the routes did (e.g. selected org outside `allowedIds`), widening or narrowing reads.
+- **Scenario**: `resolveReadScope` maps a caller state differently than the routes did, widening or narrowing reads. The first draft of this spec did exactly that in three places (narrowing after the visibility set was lost, the `access` empty scope, the tenant-less superadmin with an org).
 - **Severity**: High
 - **Affected area**: The three audit-log routes, later every migrated route.
-- **Mitigation**: Truth-table unit test (Phase 2) plus route characterization tests written before the switch (Phase 3.1).
-- **Residual risk**: A caller state not in the table. Accepted; the table is derived from the resolver's actual inputs, and unknown states map to `none`.
+- **Mitigation**: Truth-table unit test (Phase 2) plus route characterization tests written before the switch (Phase 3.1), both covering the narrowing table and R1–R8. Rule R4 is implemented and tested: a restricted caller whose effective org is missing or outside `allowedIds` gets `none`, and a restricted caller can never get `all`.
+- **Residual risk**: A state that is wrong for an unrestricted caller (`allowedIds: null`) cannot be caught by R4, because nothing bounds that caller's organization. Accepted; it equals today's behavior.
 
 #### Brand bypass through casts
 - **Scenario**: Code writes `{ kind: 'allTenants' } as unknown as ReadScope`, or imports `unsafeCreateReadScope` outside the allowlist.
@@ -248,6 +332,20 @@ None.
 - **Affected area**: Any migrated service.
 - **Mitigation**: CI allowlist for the unsafe import; `as unknown as ReadScope` is a visible code smell and greppable; reviewers check for it.
 - **Residual risk**: A deliberate cast survives review. Accepted; it is no worse than today and far more visible.
+
+#### Public constructors reachable through wildcard exports
+- **Scenario**: `@open-mercato/shared` exports `./*/*/*` and `./*/*/*/*`, so `lib/testing/readScope` (`testScope`) and `lib/auth/readScope/unsafe` resolve for any importer. Production code calls `testScope({ kind: 'allTenants', ... })`, or a route calls `systemScope`, and gets an unrestricted scope that passes the type check.
+- **Severity**: Medium
+- **Affected area**: Any migrated service.
+- **Mitigation**: `check-read-scope-constructor.mjs` fails on `testScope` outside test files, on `systemScope` in API route files, and on `/unsafe` outside the allowlist.
+- **Residual risk**: The check runs in this monorepo's CI only. A third-party module or a standalone app can still import all three. Accepted; closing it needs a `package.json` exports change, which is a contract change for a later spec.
+
+#### `access` self-read returns fewer rows (D1)
+- **Scenario**: A user whose organization visibility was emptied opens their own access log and sees nothing, where they used to see rows.
+- **Severity**: Low
+- **Affected area**: `GET /api/audit_logs/audit-logs/access`, empty-scope principals only.
+- **Mitigation**: Intended; documented in 📝 Delta and `UPGRADE_NOTES.md`, covered by a characterization test pair.
+- **Residual risk**: An integration relying on the old rows. Accepted; such a principal already gets 403 on the two action-log routes.
 
 #### Deprecated `list` keeps the fail-open behavior
 - **Scenario**: A new or third-party caller uses `list` during the deprecation window and forgets to deny an empty scope.
@@ -282,27 +380,32 @@ Not applicable: read-only change, no writes, events or external calls.
 
 1. **Manifest-driven empty-scope test** — separate spec: run every `GET` route from the generated API manifest as an empty-scope principal and as an org-A principal; assert no org-B data. Catches leaks on paths this spec does not migrate.
 2. **Single-record load scoping** (deferred Q2-b of the 2026-05-29 spec) — separate spec: `findOne({ id })` / `findOneWithDecryption` take a `ReadScope`.
-3. **`record_locks`** — issue: `findLatestActionLogWithScopeFallback` re-queries tenant-wide on a null organization; fix with `isExplicitlyEmptyOrganizationScope`, later `ReadScope`.
-4. **Inventory of optional-scope services** — tracking issue: ledger of every service method under `packages/**` (and `external/official-modules/**` when present) whose tenant/organization predicate is optional or truthiness-gated, classified migrate / safe-by-construction / system-only, with one issue per module to migrate.
-5. **Migrate the other `ActionLogService.list` callers** — one issue each: `sales/api/document-history/route.ts`, `customers/api/deals/[id]/route.ts`, `warranty_claims/lib/replacementOrderUndo.ts`.
-6. **Remove deprecated `list` / `count`** — issue gated on one minor release after the pilot and zero in-repo callers; note it in `UPGRADE_NOTES.md`.
+3. **`record_locks`** — PR #10448 (open): deny lock routes on an empty organization scope. `findLatestActionLogWithScopeFallback` re-queries tenant-wide on a null organization; moving it to `ReadScope` comes with the inventory.
+4. **Inventory of optional-scope services** — tracking issue, not filed yet: ledger of every service method under `packages/**` (and `external/official-modules/**` when present) whose tenant/organization predicate is optional or truthiness-gated, classified migrate / safe-by-construction / system-only, with one issue per module to migrate. It starts with the `ActionLogService` reads named under "Pilot boundary".
+5. **Migrate the other `ActionLogService.list` callers** — one issue each, not filed yet: `sales/api/document-history/route.ts`, `customers/api/deals/[id]/route.ts`, `warranty_claims/lib/replacementOrderUndo.ts`.
+6. **Remove deprecated `list` / `count`** — issue, not filed yet, gated on one minor release after the pilot and zero in-repo callers; note it in `UPGRADE_NOTES.md`.
 7. **Multi-org reads** (#6337) — once `some` scopes exist, restricted multi-org users could read all allowed orgs instead of `allowedIds[0]`; product decision, separate change.
 
-## Final Compliance Report — 2026-11-23
+Items 4–6 have no issue numbers because none exist yet. File them when the pilot PR opens and replace "not filed yet" with the numbers.
+
+## Final Compliance Report — 2026-11-24
 
 ### AGENTS.md Files Reviewed
 - `AGENTS.md` (root)
 - `packages/core/AGENTS.md`
 - `packages/shared/AGENTS.md`
 - `.ai/specs/AGENTS.md`
-- `BACKWARD_COMPATIBILITY.md` (deprecation protocol, as summarized in root `AGENTS.md`)
+- `BACKWARD_COMPATIBILITY.md`: Deprecation Protocol, §2 Type Definitions, §3 Function Signatures, §4 Import Paths, §7 API Route URLs, §9 DI Service Names
+- `.ai/lessons.md`: `empty-collection-scopes-need-an-explicit-semantic-predicate`, `decryption-scope-argument-is-not-a-where-filter`
 
 ### Compliance Matrix
 
 | Rule Source | Rule | Status | Notes |
 |---|---|---|---|
 | root AGENTS.md | Never expose cross-tenant data / always filter by `organization_id` | Compliant | The purpose of the spec; `none` is no-row by construction |
-| root AGENTS.md | Follow `BACKWARD_COMPATIBILITY.md` before touching contract surfaces | Compliant | Additive methods, `@deprecated` + bridge ≥1 minor, `UPGRADE_NOTES.md`, this spec carries Migration & Compatibility |
+| root AGENTS.md | Follow `BACKWARD_COMPATIBILITY.md` before touching contract surfaces | Compliant | §2 new exported types only; §3 `list` / `count` signatures unchanged, `@deprecated` + bridge ≥1 minor, `UPGRADE_NOTES.md`; §4 new import paths and one new export, resolved by the existing wildcard exports; §7 routes, parameters and status codes unchanged; §9 DI names unchanged |
+| root AGENTS.md | Preserve behavior unless a spec explicitly asks for a change | Compliant | One change, D1, stated in 📝 Delta with its reason |
+| packages/core/AGENTS.md | No module depends on another module's internals | Compliant | `isSuperAdminAuth` moves to shared; `directory` does not import from `audit_logs` |
 | root AGENTS.md | No `any`; derive types from zod | Compliant | Scoped filter types via `.omit` on existing schemas; `ReadScope` is a precise union |
 | root AGENTS.md | Ask before changing public contracts / touching multiple modules | Compliant | Architect green light obtained; pilot limited to `audit_logs` + shared + directory helper; other modules in follow-up PRs, one per module |
 | packages/shared/AGENTS.md | Shared has zero domain dependencies | Compliant | `ReadScope` and helpers are infrastructure; the resolver that reads directory scope lives in `core/directory` |
@@ -316,10 +419,11 @@ Not applicable: read-only change, no writes, events or external calls.
 | Check | Status | Notes |
 |---|---|---|
 | Data models match API contracts | Pass | No data model change |
-| API contracts match UI/UX section | Pass | No HTTP or UI change |
+| API contracts match UI/UX section | Pass | No UI change; one response-body change (D1) listed in API Contracts and 📝 Delta |
 | Risks cover all write operations | Pass | No writes |
-| Resolver truth table matches Problem Statement incidents | Pass | #3817/#3818 → `none`; #10432 → `none` |
-| Every phase leaves the app working | Pass | Phases 1–2 add code not yet called by routes; Phase 3 is behavior-preserving behind characterization tests. Phases 1–3 ship together as one capability |
+| Resolver truth table matches Problem Statement incidents | Pass | #3817/#3818 → R2 `none`; #10432 → R3 `none` |
+| Resolver tables match the routes on `main` @ `a433fc7e8d` | Pass | Narrowing expression, default-org fallback, empty-scope handling per route and the tenant-less superadmin read re-checked against the three route files and `directory/utils/organizationScope.ts` |
+| Every phase leaves the app working | Pass | Phases 1–2 add code not yet called by routes; Phase 3 is behavior-preserving behind characterization tests, except D1. Phases 1–3 ship together as one capability |
 | Scope cohesion | Pass | Fresh-context review: inventory, other-module migrations and removal moved to Follow-ups |
 
 ### Non-Compliant Items
@@ -335,3 +439,23 @@ None.
 ### 2026-11-23
 - Initial specification. Decisions agreed with the requester: tenant and organization in one scope; `orgs` excludes tenant-level rows; branded type with allowlisted constructor; manifest-driven test and single-record loads as separate linked specs; pilot limited to `ActionLogService` + `AccessLogService`. Architect approved the direction.
 - Applied fresh-context scope-cohesion review: moved the cross-repo inventory, other-module migrations and deprecated-method removal to Follow-ups; completed the File Manifest; noted `systemScope` has no production caller in the pilot.
+
+
+### 2026-11-24
+- Revised after the readiness audit on PR #52 (review 6022747329). Code references re-checked against `main` @ `a433fc7e8d`.
+- M1: removed `narrowReadScope`. `resolveReadScope` takes `requestedOrganizationId` and narrows against `scope.allowedIds` before building the scope; added the narrowing table.
+- M2: the `access` route never had the #10432 guard. An explicitly empty scope now gives an empty page there for self-reads too; recorded as Delta D1 with its own risk entry, and corrected the claim that all three routes return 403.
+- M3: split the "whole tenant" row (it needs `selectedId` and `auth.orgId` both null); `allTenants` now carries an organization part so the tenant-less superadmin read stays `organization_id = X`; added rule R4 (restricted caller with a missing or out-of-visibility org gets `none`) as an implemented, tested rule.
+- m1: the CI check also restricts `testScope` to test files and `systemScope` out of API route files; the wildcard-export limit is a documented residual risk.
+- m2: `isSuperAdminAuth` is exported from shared, so `core/directory` does not depend on `audit_logs`.
+- m3: stated the pilot boundary and named the `ActionLogService` reads left out.
+- n1 / n2: named the CI wiring (own step in the `lint` job); linked PR #10448 for `record_locks`, marked the unfiled follow-up issues as such, and cited the `BACKWARD_COMPATIBILITY.md` sections checked.
+
+### Review — 2026-11-24
+- **Reviewer**: Agent
+- **Security**: Passed. One intended tightening (D1); no widening.
+- **Performance**: Passed. No new queries; the resolver reuses the one `resolveFeatureCheckContext` call the routes already make.
+- **Cache**: N/A
+- **Commands**: N/A (read-only)
+- **Risks**: Passed. Two risks added (wildcard-export constructors, D1).
+- **Verdict**: Approved
