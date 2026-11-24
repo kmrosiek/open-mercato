@@ -13,7 +13,7 @@ Extends: `.ai/specs/implemented/2026-05-29-org-scope-fail-open-authorization-har
 - A `ReadScope` type plus query helpers in `@open-mercato/shared`.
 - A `resolveReadScope` resolver in `core/directory` that also applies the `?organizationId=` narrowing, and a named `systemScope()` for workers/CLI.
 - Pilot in `audit_logs`: `ActionLogService` and `AccessLogService` gain `listScoped` / `countScoped`; their three routes migrate; `list` / `count` are deprecated. The pilot covers `list` / `count` only; the services' other read methods stay as they are (see Follow-ups).
-- Two deliberate HTTP behavior changes, both on the `access` route for an explicitly empty organization scope, and one possible change still to be settled by a test (see 📝 Delta). Everything else is behavior-preserving.
+- Three deliberate HTTP behavior changes, all tightenings (see 📝 Delta): two on the `access` route for an explicitly empty organization scope, and one that closes a tenant-wide read reachable today on all three routes. Everything else is behavior-preserving.
 - Out of scope, tracked as follow-ups: the cross-repo inventory, migrating callers in other modules, and removing the deprecated methods.
 
 **Concerns:**
@@ -186,7 +186,8 @@ const O = Q && (V === null || V.includes(Q)) ? Q : E
 | R2 | `auth.tenantId` falsy, not superadmin | 403 (`requireResolvedTenantScope`) | 403 (same) | `none` |
 | R3a | `scope.allowedIds` is `[]` (restricted caller who can see no organization) | 403 (`resolveSingleOrganizationIdOrDeny`, since #10432) | 200. Other actors: empty page. Self-read: the caller's rows from **every organization of the tenant** | `none` (**changes the `access` self-read**, Delta D1) |
 | R3b | `scope.filterIds` is `[]` and `allowedIds` is `null` (unrestricted caller whose home org no longer exists) | 403 (same) | 200 with `tenant_id = T AND organization_id = O`, where `O` is the dead home org or an honored `Q` | `none` (**changes `access`**, Delta D2) |
-| R4 | `V` is an array and `O` is `null` or not in `V` | Not reachable through `resolveOrganizationScope`; see note | Same | `none` (possible change, Delta D3) |
+| R4a | Tenant `T`, `V` is an array, `O` is `null` | `tenant_id = T`, no org predicate (**tenant-wide for a restricted caller**) | Self-read: no org predicate. Other actors: `organization_id IN V` | `tenant T` + `some V` (**changes**, Delta D3) |
+| R4b | `V` is an array and `O` is not in `V` | Not reachable in the shapes tested (dispatcher answers 403) | Same | `none` |
 | R5 | `auth.tenantId` falsy, superadmin, `O` is `null` | All rows of all tenants | Same | `allTenants` + `all` |
 | R6 | `auth.tenantId` falsy, superadmin, `O` = `X` | `organization_id = X`, no tenant predicate | Same | `allTenants` + `some [X]` |
 | R7 | Tenant `T`, `V` is `null`, `O` is `null` | `tenant_id = T`, no org predicate | Same | `tenant T` + `all` |
@@ -195,7 +196,7 @@ const O = Q && (V === null || V.includes(Q)) ? Q : E
 Notes on the rows:
 
 - **R3a and R3b are one check** (`isExplicitlyEmptyOrganizationScope`), split here because `access` treats them differently today. R3b arises when `resolveOrganizationScope` drops a home org that no longer resolves and the fallback set comes back empty (`organizationScope.ts:357-391`).
-- **R4 is the "unknown state" rule.** `resolveOrganizationScope` only returns a `selectedId` inside the allowed set, `E` checks `auth.orgId` against `V`, and `Q` is checked in Step 1, so a scope that comes straight from it always has `O` inside `V`. One path is not covered by that argument: the API dispatcher calls `resolveFeatureCheckContext` with the route's `requiredFeatures` and binds the result to the request. When no org is selected and the caller's feature access is limited to some organizations, it replaces `allowedIds` with the feature-approved set **after** computing `E` (`organizationScope.ts:587-634`), and the route receives that binding. A principal with no home org and an unrestricted organization list could then arrive with `V` as an array and `O` as `null`. Whether such a principal passes the dispatcher's own feature check (made with `organizationId: null`) is not established. If it does, today `actions` and the `access` self-read run tenant-wide and `access` other-actor reads use `organization_id IN V`; after migration all get `none`. Phase 3.1 must settle this with a test before the switch (Delta D3). A restricted caller (`V` is an array) can never receive `all`.
+- **R4 covers a restricted caller without a usable single organization.** `resolveOrganizationScope` only returns a `selectedId` inside the allowed set, `E` checks `auth.orgId` against `V`, and `Q` is checked in Step 1, so a scope that comes straight from it always has `O` inside `V`. The exception is the dispatcher: it calls `resolveFeatureCheckContext` with the route's `requiredFeatures` and binds the result to the request. When no org is selected and the caller's feature access is limited to some organizations, it replaces `allowedIds` with the feature-approved set **after** computing `E` (`organizationScope.ts:587-634`), and the route receives that binding. **R4a is reachable** this way by an API key with no organization (Delta D3): `V` is `[A]` and `O` is `null`. The resolver returns `some V`, so the caller reads exactly the organizations its feature grant covers; this is what `access` already does for other-actor reads (`access/route.ts:125-127`). **R4b** (an effective org outside `V`) was stopped by the dispatcher with 403 in every shape tested; it stays `none` as the fail-closed default. A restricted caller (`V` is an array) can never receive `all`.
 - **R7 is narrower than "unrestricted caller with no selection".** `E` falls back to `auth.orgId`, so an unrestricted non-superadmin with a home org lands in R8 with their home org, even after choosing "All organizations". R7 is reached only when `scope.selectedId` and `auth.orgId` are both `null` and no `Q` is honored: a superadmin viewing all organizations (the org cookie override clears `auth.orgId`), or a principal with no home org.
 - **R5 / R6**: a superadmin reaches the routes without a tenant only as an API key with a null tenant or through a trusted auth envelope; a blank tenant cookie is not applied. "All rows" is still subject to the actor filters the routes add (`access` defaults to the caller's own rows).
 - **R6**: `Q` is honored for an unrestricted caller without checking which tenant the org belongs to, as today. With a tenant (R8) a foreign org id matches no rows; without one (R6) it reads that org. Only a superadmin reaches R6.
@@ -204,10 +205,10 @@ Notes on the rows:
 
 **Per-route result after migration.**
 
-| Route | R2 | R3a | R3b | R4 | R5–R8 |
-|---|---|---|---|---|---|
-| `actions`, `actions/export` | 403, unchanged | 403, unchanged | 403, unchanged | 200 empty (D3 if reachable) | Unchanged |
-| `access` | 403, unchanged | 200 empty page (**self-read changes**, D1) | 200 empty page (**changes**, D2) | 200 empty (D3 if reachable) | Unchanged |
+| Route | R2 | R3a | R3b | R4a | R4b | R5–R8 |
+|---|---|---|---|---|---|---|
+| `actions`, `actions/export` | 403, unchanged | 403, unchanged | 403, unchanged | Rows of `allowedIds` only (**changes**, D3) | 200 empty (not reachable in the shapes tested) | Unchanged |
+| `access` | 403, unchanged | 200 empty page (**self-read changes**, D1) | 200 empty page (**changes**, D2) | Rows of `allowedIds` only (**self-read changes**, D3) | 200 empty (not reachable in the shapes tested) | Unchanged |
 
 ### Commands & Events
 
@@ -236,17 +237,17 @@ DI keys `actionLogService` / `accessLogService` are unchanged.
 
 ## 📝 Delta
 
-Two certain HTTP behavior changes, both on the `access` route and both for a caller whose organization scope is explicitly empty, plus one possible change. Everything else is frozen by characterization tests.
+Three HTTP behavior changes, all tightenings. D1 and D2 are on the `access` route for a caller whose organization scope is explicitly empty. D3 closes a tenant-wide read that is live today on all three routes. Everything else is frozen by characterization tests.
 
 | # | Route | Caller state | Today | After |
 |---|---|---|---|---|
 | D1 | `GET /api/audit_logs/audit-logs/access` | `allowedIds: []`, reading own rows (`actorUserId === auth.sub`) | 200 with the caller's access-log rows from every organization of the tenant (the route passes `organizationIds: undefined`, so the service adds no org predicate) | 200 with an empty page (`items: []`, `total: 0`) |
 | D2 | `GET /api/audit_logs/audit-logs/access` | `filterIds: []` with `allowedIds: null` (unrestricted caller whose home org no longer exists) | 200 with rows of the dead home org, or of any org named in `?organizationId=`, for self-reads and other-actor reads | 200 with an empty page |
-| D3 (possible) | All three | Rule R4: restricted `allowedIds` with no effective org, or one outside it | Not known to be reachable. If it is: tenant-wide on `actions`, `actions/export` and the `access` self-read | 200 with an empty page / empty CSV |
+| D3 | `actions`, `actions/export`, `access` | Rule R4a: restricted `allowedIds` with no effective org. Reachable by an API key with no organization whose audit-log features come from an organization-restricted role | `actions`, `actions/export`: every action log of the tenant. `access` self-read: the caller's rows from every organization. `access` other-actor reads: `organization_id IN allowedIds` | All three: `organization_id IN allowedIds`. The `access` other-actor read is unchanged |
 
 Why D1 and D2 are accepted instead of preserved: an explicitly empty scope means "this principal can see no organization" (#10432, lesson `empty-collection-scopes-need-an-explicit-semantic-predicate`). `actions` and `actions/export` already answer 403 for both states. D1 returns resource kinds and ids from organizations the caller can no longer see. Preserving either would need the resolver to hand an organization scope to a caller whose scope is empty. The status stays 200 so the route's documented contract does not change; aligning it with the 403 of `actions` is not part of this spec.
 
-D3 is a decision gate, not an accepted change. Phase 3.1 writes a test that drives the routes through the dispatcher's bound feature scope for a principal with no home org. If the state is unreachable, D3 is deleted from this table. If it is reachable, it is a tenant-wide read by a caller whose feature access is limited to some organizations; the fix (`none`) stays, and the row is confirmed here and in `UPGRADE_NOTES.md` before the pilot merges.
+D3 was an open question in the previous revision and is now confirmed. A regular API key can be created with no organization. Give it one role with unrestricted organization visibility and one role limited to organization A that holds `audit_logs.view_self` and `audit_logs.view_tenant`. The dispatcher's feature check runs with `organizationId: null`, where organization-restricted roles all apply, so it passes; `resolveFeatureCheckContext` narrows `allowedIds` to `[A]` but leaves `organizationId` null; the routes then add no organization predicate. `resolveSingleOrganizationIdOrDeny` does not stop it, because `[A]` is not empty. A regular user cannot reach this state through product paths, because users must have a home organization. Evidence: a unit test on `main` @ `a433fc7e8d` with the real `RbacService`, scope resolution and route handlers; database data and the log services are mocked, and it was not run against a live app. With `?organizationId=A` the same key already reads A only (R8), today and after.
 
 Not changed: a caller with `allowedIds: []` reading other actors on `access` already gets an empty page, and `actions` / `actions/export` already return 403 (only those two got the #10432 guard; `access` never did).
 
@@ -282,14 +283,14 @@ None.
 ### Phase 2: resolver in core/directory
 1. Export `isSuperAdminAuth` from `packages/shared/src/lib/auth/server.ts` (it is module-private today at line 155). `audit_logs/api/audit-logs/readScope.ts` drops its private copy and imports it. `core/directory` imports nothing from `audit_logs`.
 2. Add `deriveReadScope` and `resolveReadScope` in `packages/core/src/modules/directory/utils/readScope.ts`, built on `resolveFeatureCheckContext`, `isExplicitlyEmptyOrganizationScope` and `isSuperAdminAuth`.
-3. Table-driven unit test of `deriveReadScope`: every row of the Step 1 table (requested org inside and outside visibility, with `allowedIds` both `null` and an array) and every rule R1–R8, including R4 with a hand-built inconsistent context (restricted caller with no effective org, and with an effective org outside `allowedIds`) asserting `none`.
+3. Table-driven unit test of `deriveReadScope`: every row of the Step 1 table (requested org inside and outside visibility, with `allowedIds` both `null` and an array) and every rule R1–R8, including R4a (restricted caller with no effective org → `some allowedIds`) and R4b with a hand-built inconsistent context (effective org outside `allowedIds` → `none`).
 
 ### Phase 3: `audit_logs` pilot
-1. Characterization tests first: for `actions`, `actions/export`, `access` routes, assert status and the service query for every row of both resolver tables (extending `api/__tests__/{actions,export,access}.route.test.ts`). They must pass on the unchanged code. The `access` tests cover both empty-scope shapes (R3a, R3b) for a self-read and an other-actor read. One test drives each route through the dispatcher's bound feature scope (`bindFeatureScopeToRequest`) for a principal with no home org, to decide Delta D3.
+1. Characterization tests first: for `actions`, `actions/export`, `access` routes, assert status and the service query for every row of both resolver tables (extending `api/__tests__/{actions,export,access}.route.test.ts`). They must pass on the unchanged code. The `access` tests cover both empty-scope shapes (R3a, R3b) for a self-read and an other-actor read. The D3 tests build the R4a principal with the real `RbacService` and the real `resolveFeatureCheckContext` (the dispatcher call with `requiredFeatures`, then the route's own call on the same request), not a hand-built scope, and assert today's tenant-wide query.
 2. Add `listScoped` / `countScoped` to `ActionLogService`; `buildListQuery` takes the scope through `applyReadScopeToKysely`; `list` / `count` map their optional ids onto the same builder, unchanged in behavior. Service unit tests for every scope kind, including `allTenants` + `some` and `none` returning no rows without decrypting anything.
 3. Add `AccessLogService.listScoped`; same approach.
 4. Migrate the three routes to `resolveReadScope({ ..., requestedOrganizationId })` + `listScoped`. Keep `requireResolvedTenantScope` and the #10432 403 responses on `actions` / `actions/export`. Characterization tests stay green; the D1 and D2 expectations flip in this commit. Non-UUID ids still produce 400.
-5. Mark `list` / `count` `@deprecated`; add the `UPGRADE_NOTES.md` entry, which also records D1, D2 and (if confirmed) D3; update the `packages/core/AGENTS.md` "Access Control" section with a one-line rule: "read services take a `ReadScope`".
+5. Mark `list` / `count` `@deprecated`; add the `UPGRADE_NOTES.md` entry, which also records D1, D2 and D3; update the `packages/core/AGENTS.md` "Access Control" section with a one-line rule: "read services take a `ReadScope`".
 
 **Pilot boundary.** "The pilot services fail closed" applies to `list` / `count` only. These `ActionLogService` reads keep an optional or truthiness-gated scope, or none at all, and are not touched: `latestUndoableForActor`, `latestUndoneForActor`, `latestUndoableForResource`, `findById`, `findByUndoToken`, and the related-entries query (`actionLogService.ts:911-912`). They belong to Follow-ups 2 (single-record loads) and 4 (inventory).
 
@@ -331,8 +332,15 @@ None.
 - **Scenario**: `resolveReadScope` maps a caller state differently than the routes did, widening or narrowing reads. The first draft of this spec did exactly that in three places (narrowing after the visibility set was lost, the `access` empty scope, the tenant-less superadmin with an org).
 - **Severity**: High
 - **Affected area**: The three audit-log routes, later every migrated route.
-- **Mitigation**: Truth-table unit test (Phase 2) plus route characterization tests written before the switch (Phase 3.1), both covering the narrowing table and R1–R8. Rule R4 is implemented and tested: a restricted caller whose effective org is missing or outside `allowedIds` gets `none`, and a restricted caller can never get `all`.
-- **Residual risk**: A state that is wrong for an unrestricted caller (`allowedIds: null`) cannot be caught by R4, because nothing bounds that caller's organization. Accepted; it equals today's behavior. R4 itself may be reachable through the dispatcher's bound feature scope (Delta D3); that is open until the Phase 3.1 test runs.
+- **Mitigation**: Truth-table unit test (Phase 2) plus route characterization tests written before the switch (Phase 3.1), both covering the narrowing table and R1–R8. Rule R4 is implemented and tested: a restricted caller with no effective org reads only its `allowedIds`, one whose effective org lies outside `allowedIds` gets `none`, and a restricted caller can never get `all`.
+- **Residual risk**: A state that is wrong for an unrestricted caller (`allowedIds: null`) cannot be caught by R4, because nothing bounds that caller's organization. Accepted; it equals today's behavior.
+
+#### The pilot closes D3 on three routes only
+- **Scenario**: The D3 principal (an API key with no organization and organization-restricted feature grants) passes the dispatcher's feature check on any route. Other custom read routes that filter by organization only when one is set, and ignore `scope.filterIds`, have the same exposure. `makeCrudRoute` reads are not affected: the factory filters by `filterIds`.
+- **Severity**: High
+- **Affected area**: Custom (non-`makeCrudRoute`) read routes outside `audit_logs`.
+- **Mitigation**: Out of scope here. It needs its own security fix at the point where the feature-check context is built (`resolveFeatureCheckContext` leaves `organizationId` null after narrowing `allowedIds`), independent of this spec's timeline. Follow-up 4 (inventory) then moves the remaining services to `ReadScope`.
+- **Residual risk**: Until that fix ships, only the three pilot routes are protected, and only once the pilot itself ships.
 
 #### Brand bypass through casts
 - **Scenario**: Code writes `{ kind: 'allTenants' } as unknown as ReadScope`, or imports `unsafeCreateReadScope` outside the allowlist.
@@ -377,7 +385,7 @@ None.
 - **Scenario**: `organization_id IN (...)` with many ids is slightly heavier than `=`.
 - **Severity**: Low
 - **Affected area**: Tenants with many organizations, once multi-org `some` scopes are used.
-- **Mitigation**: The pilot keeps single-org narrowing (one id); existing indexes on `organization_id` apply.
+- **Mitigation**: The pilot keeps single-org narrowing (one id) everywhere except rule R4a, where the list is the caller's feature-approved organizations; existing indexes on `organization_id` apply.
 - **Residual risk**: Negligible.
 
 ### Data Integrity / Cascading Failures
@@ -412,7 +420,7 @@ Items 4–6 have no issue numbers because none exist yet. File them when the pil
 |---|---|---|---|
 | root AGENTS.md | Never expose cross-tenant data / always filter by `organization_id` | Compliant | The purpose of the spec; `none` is no-row by construction |
 | root AGENTS.md | Follow `BACKWARD_COMPATIBILITY.md` before touching contract surfaces | Compliant | §2 new exported types only; §3 `list` / `count` signatures unchanged, `@deprecated` + bridge ≥1 minor, `UPGRADE_NOTES.md`; §4 new import paths and one new export, resolved by the existing wildcard exports; §7 routes, parameters and status codes unchanged; §9 DI names unchanged |
-| root AGENTS.md | Preserve behavior unless a spec explicitly asks for a change | Compliant | D1 and D2 stated in 📝 Delta with their reason; D3 is an open gate settled in Phase 3.1 |
+| root AGENTS.md | Preserve behavior unless a spec explicitly asks for a change | Compliant | D1, D2 and D3 stated in 📝 Delta with their reason |
 | packages/core/AGENTS.md | No module depends on another module's internals | Compliant | `isSuperAdminAuth` moves to shared; `directory` does not import from `audit_logs` |
 | root AGENTS.md | No `any`; derive types from zod | Compliant | Scoped filter types via `.omit` on existing schemas; `ReadScope` is a precise union |
 | root AGENTS.md | Ask before changing public contracts / touching multiple modules | Compliant | Architect green light obtained; pilot limited to `audit_logs` + shared + directory helper; other modules in follow-up PRs, one per module |
@@ -440,14 +448,13 @@ None.
 
 ### Verdict
 
-- **Fully compliant**: Approved — ready for implementation. One gate inside Phase 3.1 (Delta D3) must be settled before the routes switch.
+- **Fully compliant**: Approved — ready for implementation.
 
 ## Changelog
 
 ### 2026-11-23
 - Initial specification. Decisions agreed with the requester: tenant and organization in one scope; `orgs` excludes tenant-level rows; branded type with allowlisted constructor; manifest-driven test and single-record loads as separate linked specs; pilot limited to `ActionLogService` + `AccessLogService`. Architect approved the direction.
 - Applied fresh-context scope-cohesion review: moved the cross-repo inventory, other-module migrations and deprecated-method removal to Follow-ups; completed the File Manifest; noted `systemScope` has no production caller in the pilot.
-
 
 ### 2026-11-24
 - Revised after the readiness audit on PR #52 (review 6022747329). Code references re-checked against `main` @ `a433fc7e8d`.
@@ -460,11 +467,17 @@ None.
 - m3: stated the pilot boundary and named the `ActionLogService` reads left out.
 - n1 / n2: named the CI wiring (own step in the `lint` job); linked PR #10448 for `record_locks`, marked the unfiled follow-up issues as such, and cited the `BACKWARD_COMPATIBILITY.md` sections checked.
 
+### 2026-11-24 (D3 settled)
+- D3 is confirmed reachable on `main` @ `a433fc7e8d`, by a unit test that runs the real `RbacService`, the real scope resolution and the real route handlers (database data and log services mocked; not run against a live app). The principal is a regular API key with no organization, one role with unrestricted organization visibility and one organization-restricted role holding the audit-log features.
+- Split R4. R4a (restricted caller, no effective org) now resolves to `tenant` + `some allowedIds` instead of `none`: the caller reads exactly the organizations its feature grant covers, which is what the `access` route already does for other-actor reads. R4b (effective org outside `allowedIds`) stays `none`; the shapes tested for it are stopped by the dispatcher with 403.
+- D3 is now an accepted change, with the before / after per route. Phase 3.1 keeps the reproduction as a characterization pair.
+- Noted that the cause is not specific to audit logs and that this pilot closes only its three routes.
+
 ### Review — 2026-11-24
 - **Reviewer**: Agent
-- **Security**: Passed. Two intended tightenings (D1, D2), one open gate (D3); no widening.
+- **Security**: Passed. Three intended tightenings (D1, D2, D3); no widening. D3 closes a read that is live on `main` for the three pilot routes only.
 - **Performance**: Passed. No new queries; the resolver reuses the one `resolveFeatureCheckContext` call the routes already make.
 - **Cache**: N/A
 - **Commands**: N/A (read-only)
-- **Risks**: Passed. Two risks added (wildcard-export constructors, D1/D2).
-- **Verdict**: Approved, with gate D3 inside Phase 3.1
+- **Risks**: Passed. Three risks added (wildcard-export constructors, D1/D2, D3 beyond the pilot routes).
+- **Verdict**: Approved
