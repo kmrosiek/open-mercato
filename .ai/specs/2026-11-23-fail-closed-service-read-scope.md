@@ -339,7 +339,7 @@ None.
 - **Scenario**: The D3 principal (an API key with no organization and organization-restricted feature grants) passes the dispatcher's feature check on any route. Other custom read routes that filter by organization only when one is set, and ignore `scope.filterIds`, have the same exposure. `makeCrudRoute` reads are not affected: the factory filters by `filterIds`.
 - **Severity**: High
 - **Affected area**: Custom (non-`makeCrudRoute`) read routes outside `audit_logs`.
-- **Mitigation**: Out of scope here. It needs its own security fix at the point where the feature-check context is built (`resolveFeatureCheckContext` leaves `organizationId` null after narrowing `allowedIds`), independent of this spec's timeline. Follow-up 4 (inventory) then moves the remaining services to `ReadScope`.
+- **Mitigation**: Out of scope here. A separate security fix (kmrosiek/open-mercato PR #54) changes the point where the feature-check context is built (`resolveFeatureCheckContext` left `organizationId` null after narrowing `allowedIds`) and scopes three further routes directly, independent of this spec's timeline. Once it merges, the D3 principal reaches the audit-log routes with an effective organization (R8), and R4a remains as the resolver's own guard. Follow-up 4 (inventory) then moves the remaining services to `ReadScope`.
 - **Residual risk**: Until that fix ships, only the three pilot routes are protected, and only once the pilot itself ships.
 
 #### Brand bypass through casts
@@ -472,6 +472,7 @@ None.
 - Split R4. R4a (restricted caller, no effective org) now resolves to `tenant` + `some allowedIds` instead of `none`: the caller reads exactly the organizations its feature grant covers, which is what the `access` route already does for other-actor reads. R4b (effective org outside `allowedIds`) stays `none`; the shapes tested for it are stopped by the dispatcher with 403.
 - D3 is now an accepted change, with the before / after per route. Phase 3.1 keeps the reproduction as a characterization pair.
 - Noted that the cause is not specific to audit logs and that this pilot closes only its three routes.
+- Linked the separate fix for the D3 principal (PR #54) from the risk entry.
 
 ### Review — 2026-11-24
 - **Reviewer**: Agent
